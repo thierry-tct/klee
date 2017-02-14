@@ -77,12 +77,19 @@ ExecutionState::ExecutionState(KFunction *kf) :
     instsSinceCovNew(0),
     coveredNew(false),
     forkDisabled(false),
-    ptreeNode(0) {
+    ptreeNode(0),
+    symbexEnabled(false), seedingTTL(0), seedingInstExecuted(0),
+    lastInstructionGEP(false), markForDeletion(false), branchTime(NULL),
+    nextForkInterleaved(false), inPatch(false) { 
   pushFrame(0, kf);
 }
 
 ExecutionState::ExecutionState(const std::vector<ref<Expr> > &assumptions)
-    : constraints(assumptions), queryCost(0.), ptreeNode(0) {}
+    : constraints(assumptions), queryCost(0.), ptreeNode(0),
+      fakeState(true), underConstrained(false), symbexEnabled(false),
+      seedingTTL(0), seedingInstExecuted(0), lastInstructionGEP(false),
+      markForDeletion(false), branchTime(NULL), nextForkInterleaved(false),
+      inPatch(false) {} 
 
 ExecutionState::~ExecutionState() {
   for (unsigned int i=0; i<symbolics.size(); i++)
@@ -120,7 +127,18 @@ ExecutionState::ExecutionState(const ExecutionState& state):
     coveredLines(state.coveredLines),
     ptreeNode(state.ptreeNode),
     symbolics(state.symbolics),
-    arrayNames(state.arrayNames)
+    arrayNames(state.arrayNames),
+
+    shadowObjects(state.shadowObjects),
+    symbexEnabled(state.symbexEnabled), seedingTTL(state.seedingTTL),
+    seedingInstExecuted(state.seedingInstExecuted),
+
+    lastInstructionGEP(state.lastInstructionGEP),
+    markForDeletion(state.markForDeletion),
+    // XXX setting pointer to NULL after Zesti rebaseline;
+    // --lest-max-branch-time will not work
+    branchTime(0), nextForkInterleaved(state.nextForkInterleaved),
+    inPatch(state.inPatch)
 {
   for (unsigned int i=0; i<symbolics.size(); i++)
     symbolics[i].first->refCount++;

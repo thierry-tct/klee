@@ -20,6 +20,7 @@
 #include "klee/Internal/Module/Cell.h"
 #include "klee/Internal/Module/KInstruction.h"
 #include "klee/Internal/Module/KModule.h"
+#include "klee/Solver.h"
 #include "klee/util/ArrayCache.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -80,7 +81,7 @@ namespace klee {
   /// during an instruction step. Should contain addedStates,
   /// removedStates, and haltExecution, among others.
 
-class Executor : public Interpreter {
+class Executor : public Interpreter, public InstructionInfoProvider {
   friend class BumpMergingSearcher;
   friend class MergingSearcher;
   friend class RandomPathSearcher;
@@ -210,6 +211,12 @@ private:
   // @brief buffer to store logs before flushing to file
   llvm::raw_string_ostream debugLogBuffer;
 
+  /// used by the InstructionInfoProvider implementation
+  const InstructionInfo *currentInstructionInfo;
+
+  /// maximum top-level branch execution times
+  std::vector<double> topLevelBranchTimes;
+
   llvm::Function* getTargetFunction(llvm::Value *calledVal,
                                     ExecutionState &state);
   
@@ -217,6 +224,8 @@ private:
 
   void printFileLine(ExecutionState &state, KInstruction *ki,
                      llvm::raw_ostream &file);
+
+  void closeFirstFds(void);
 
   void run(ExecutionState &initialState);
 
@@ -356,7 +365,10 @@ private:
   /// Return a unique constant value for the given expression in the
   /// given state, if it has one (i.e. it provably only has a single
   /// value). Otherwise return the original expression.
-  ref<Expr> toUnique(const ExecutionState &state, ref<Expr> &e);
+  /// By default uses the seeds when available (zest). This is preferrable
+  /// when choosing a size for malloc or when calling externals
+  ref<Expr> toUnique(const ExecutionState &state, ref<Expr> &e, 
+                     bool symbexUsesSeeds = true);
 
   /// Return a constant value for the given expression, forcing it to
   /// be constant in the given state by adding a constraint if
@@ -433,6 +445,8 @@ private:
   void printDebugInstructions(ExecutionState &state);
   void doDumpStates();
 
+  bool isOnConcretePath(ExecutionState &state);
+
 public:
   Executor(const InterpreterOptions &opts, InterpreterHandler *ie);
   virtual ~Executor();
@@ -470,7 +484,7 @@ public:
     usingSeeds = seeds;
   }
 
-  virtual void runFunctionAsMain(llvm::Function *f,
+  virtual int runFunctionAsMain(llvm::Function *f,
                                  int argc,
                                  char **argv,
                                  char **envp);
@@ -505,6 +519,24 @@ public:
                                std::map<const std::string*, std::set<unsigned> > &res);
 
   Expr::Width getWidthForLLVMType(LLVM_TYPE_Q llvm::Type *type) const;
+  
+  std::vector<unsigned char> readObjectAtAddress(ExecutionState &state,
+                                                 ref<Expr> addressExpr);
+  void enableSeeding(ExecutionState &state, unsigned TTL, int interleave = 0);
+  void disableSeeding(ExecutionState &state);
+  void addSensitiveInstruction(const klee::ExecutionState &);
+
+  // InstructionInfoProvider
+  const InstructionInfo *GetCurrentInstruction() const {
+    return currentInstructionInfo;
+  }
+
+  /// Used to prioritize states in zest searcher mode
+  std::multimap<int, ExecutionState *> instructionToState;
+  std::vector<int> sensitiveInst;
+
+  enum Stage { ZEST, Concolic };
+  Stage stage;
 };
   
 } // End klee namespace

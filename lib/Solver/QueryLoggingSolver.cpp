@@ -33,6 +33,9 @@ llvm::cl::opt<bool> CreateCompressedQueryLog(
 #endif
 }
 
+// hack to log only mem accesses
+volatile int doLog;
+
 QueryLoggingSolver::QueryLoggingSolver(Solver *_solver, std::string path,
                                        const std::string &commentSign,
                                        int queryTimeToLog)
@@ -77,6 +80,8 @@ void QueryLoggingSolver::flushBufferConditionally(bool writeToFile) {
 void QueryLoggingSolver::startQuery(const Query &query, const char *typeName,
                                     const Query *falseQuery,
                                     const std::vector<const Array *> *objects) {
+  if (!doLog)
+    return;
   Statistic *S = theStatisticManager->getStatisticByName("Instructions");
   uint64_t instructions = S ? S->getValue() : 0;
 
@@ -93,6 +98,8 @@ void QueryLoggingSolver::startQuery(const Query &query, const char *typeName,
 }
 
 void QueryLoggingSolver::finishQuery(bool success) {
+  if (!doLog)
+    return;
   lastQueryTime = getWallTime() - startTime;
   logBuffer << queryCommentSign << "   " << (success ? "OK" : "FAIL") << " -- "
             << "Elapsed: " << lastQueryTime << "\n";
@@ -129,15 +136,17 @@ bool QueryLoggingSolver::computeTruth(const Query &query, bool &isValid) {
 
   bool success = solver->impl->computeTruth(query, isValid);
 
-  finishQuery(success);
+  if (doLog) {
+    finishQuery(success);
 
-  if (success) {
-    logBuffer << queryCommentSign
-              << "   Is Valid: " << (isValid ? "true" : "false") << "\n";
+    if (success) {
+      logBuffer << queryCommentSign
+                << "   Is Valid: " << (isValid ? "true" : "false") << "\n";
+    }
+    logBuffer << "\n";
+
+    flushBuffer();
   }
-  logBuffer << "\n";
-
-  flushBuffer();
 
   return success;
 }
@@ -148,14 +157,16 @@ bool QueryLoggingSolver::computeValidity(const Query &query,
 
   bool success = solver->impl->computeValidity(query, result);
 
-  finishQuery(success);
+  if (doLog) {
+    finishQuery(success);
 
-  if (success) {
-    logBuffer << queryCommentSign << "   Validity: " << result << "\n";
+    if (success) {
+      logBuffer << queryCommentSign << "   Validity: " << result << "\n";
+    }
+    logBuffer << "\n";
+
+    flushBuffer();
   }
-  logBuffer << "\n";
-
-  flushBuffer();
 
   return success;
 }
@@ -166,14 +177,16 @@ bool QueryLoggingSolver::computeValue(const Query &query, ref<Expr> &result) {
 
   bool success = solver->impl->computeValue(query, result);
 
-  finishQuery(success);
+  if (doLog) {
+    finishQuery(success);
 
-  if (success) {
-    logBuffer << queryCommentSign << "   Result: " << result << "\n";
+    if (success) {
+      logBuffer << queryCommentSign << "   Result: " << result << "\n";
+    }
+    logBuffer << "\n";
+
+    flushBuffer();
   }
-  logBuffer << "\n";
-
-  flushBuffer();
 
   return success;
 }
@@ -187,6 +200,9 @@ bool QueryLoggingSolver::computeInitialValues(
       solver->impl->computeInitialValues(query, objects, values, hasSolution);
 
   finishQuery(success);
+
+  if (!doLog)
+    return success;
 
   if (success) {
     logBuffer << queryCommentSign

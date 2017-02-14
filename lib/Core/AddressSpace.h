@@ -87,7 +87,8 @@ namespace klee {
                  ref<Expr> address, 
                  ResolutionList &rl, 
                  unsigned maxResolutions=0,
-                 double timeout=0.);
+                 double timeout=0.,
+                 bool useSeeds = true);
 
     /***/
 

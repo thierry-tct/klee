@@ -106,11 +106,18 @@
 
 #include <errno.h>
 #include <cxxabi.h>
+#include <unistd.h>
 
 using namespace llvm;
 using namespace klee;
 
+/* also used by the driver (tools/klee/main.cpp) */
+bool UseConcretePath;
+bool ReserveFds;
+bool ZestSkipChecks;
 
+/* also used by the Zest Searcher (lib/Core/Searcher.cpp) */
+unsigned PatchCheckBefore;
 
 
 
@@ -119,7 +126,43 @@ namespace {
   DumpStatesOnHalt("dump-states-on-halt",
                    cl::init(true),
 		   cl::desc("Dump test cases for all active states on exit (default=on)"));
-  
+ 
+  cl::opt<bool> NoPreferCex("no-prefer-cex", cl::init(false));
+
+  cl::opt<unsigned> MaxCexSize("max-cex-size", cl::init(2048));
+
+  cl::opt<bool> UseAsmAddresses("use-asm-addresses", cl::init(false));
+
+  static cl::opt<bool, true> _UseConcretePath("use-concrete-path",
+                                              cl::location(UseConcretePath),
+                                              cl::init(false));
+
+  static cl::opt<bool, true> _ZEST("zest", cl::location(UseConcretePath),
+                                   cl::init(false));
+
+  /* equivalent to --use-symbex=1 --use-zest-search --zest-search-heuristic=br
+   * --symbex-before-by=n --zest-search-until=n */
+  static cl::opt<unsigned, true> _PatchCheckBefore(
+      "patch-check-before", cl::location(PatchCheckBefore), cl::init(0),
+      cl::desc("start symbex n inst/branches before the patch. \
+Equivalent to --symbex-before-by=n --zest-search-until=n \
+--use-symbex=1 --use-zest-search --zest-search-heuristic=br \
+Only works (well) with branch distance heuristic (--zest-search-heuristic=br)"));
+
+  cl::opt<bool> PatchManualBranch(
+      "patch-manual-branch", cl::init(false),
+      cl::desc(
+          "Don't automatically fork on every branch. Code must be manually \
+instrumented with enable_seeding intrinsic calls."));
+
+  static cl::opt<bool, true>
+      _ReserveFds("reserve-fds", cl::location(ReserveFds), cl::init(false));
+
+  cl::opt<bool> RandomizeFork(
+      "randomize-fork", cl::init(false),
+      cl::desc(
+          "Randomly swap the true and false states on a fork (default=off)"));
+ 
   cl::opt<bool>
   AllowExternalSymCalls("allow-external-sym-calls",
                         cl::init(false),
@@ -314,8 +357,44 @@ namespace {
   MaxMemoryInhibit("max-memory-inhibit",
             cl::desc("Inhibit forking at memory cap (vs. random terminate) (default=on)"),
             cl::init(true));
+
+  cl::opt<unsigned int>
+      SymbexEvery("use-symbex",
+                  cl::desc("Enable symbolic execution every n instructions in "
+                           "zest mode (0=off, 1=on, >1 advanced use only)"),
+                  cl::init(0));
+
+  cl::opt<unsigned int>
+      SymbexFor("symbex-for",
+                cl::desc("Run symbolically for n instructions (use in "
+                         "conjunction with symbex-every) (default=100)"),
+                cl::init(100));
+
+  cl::opt<bool>
+      EveryAccessIsSensitive("every-access",
+                             cl::desc("ZEST searcher treats all memory "
+                                      "accesses as sensitive (default true)"),
+                             cl::init(false));
+
+  cl::opt<bool> ZestContinueAfterError(
+      "zest-continue-after-error",
+      cl::desc("Continues searching after an error is found"), cl::init(false));
+
+  enum ZESTSearchHeuristic { Instructions, Branches };
+  cl::opt<ZESTSearchHeuristic> ZESTSearchHeuristic(
+      "zest-search-heuristic",
+      cl::values(clEnumValN(Instructions, "inst", "Instructions"),
+                 clEnumValN(Branches, "br", "Branches"), clEnumValEnd),
+      cl::init(Branches));
+  cl::opt<double>
+      LESTMaxBranchTime("lest-max-branch-time",
+                        cl::desc("Maximum execution time on each top-level "
+                                 "branch (default disabled (0))"),
+                        cl::init(0.0));
 }
 
+static int32_t programExitCode = 0;
+extern volatile int doLog;
 
 namespace klee {
   RNG theRNG;
@@ -346,7 +425,13 @@ Executor::Executor(const InterpreterOptions &opts, InterpreterHandler *ih)
       coreSolverTimeout(MaxCoreSolverTime != 0 && MaxInstructionTime != 0
                             ? std::min(MaxCoreSolverTime, MaxInstructionTime)
                             : std::max(MaxCoreSolverTime, MaxInstructionTime)),
-      debugInstFile(0), debugLogBuffer(debugBufferString) {
+      debugInstFile(0), debugLogBuffer(debugBufferString),
+      currentInstructionInfo(0) {
+  if (true == UseConcretePath) {
+    doLog = 0;
+  } else {
+    doLog = 1;
+  }
 
   if (coreSolverTimeout) UseForkedCoreSolver = true;
   Solver *coreSolver = klee::createCoreSolver(CoreSolverToUse);
@@ -359,9 +444,19 @@ Executor::Executor(const InterpreterOptions &opts, InterpreterHandler *ih)
       interpreterHandler->getOutputFilename(ALL_QUERIES_SMT2_FILE_NAME),
       interpreterHandler->getOutputFilename(SOLVER_QUERIES_SMT2_FILE_NAME),
       interpreterHandler->getOutputFilename(ALL_QUERIES_KQUERY_FILE_NAME),
-      interpreterHandler->getOutputFilename(SOLVER_QUERIES_KQUERY_FILE_NAME));
+      interpreterHandler->getOutputFilename(SOLVER_QUERIES_KQUERY_FILE_NAME),
+      (InstructionInfoProvider *)this);
 
-  this->solver = new TimingSolver(solver, EqualitySubstitution);
+/// XXX MN: reintegrate remaining lines
+  if (!UseConcretePath) {
+     this->solver = new TimingSolver(solver, EqualitySubstitution);
+  } else {
+     this->solver = new TimingSolver(solver, EqualitySubstitution, &seedMap);
+  }
+
+  // FIXME support arbitrary number of branches from the concrete path
+  topLevelBranchTimes.reserve(10240);
+
   memory = new MemoryManager(&arrayCache);
 
   if (optionIsSet(DebugPrintInstructions, FILE_ALL) ||
@@ -694,6 +789,18 @@ void Executor::branch(ExecutionState &state,
   } else {
     stats::forks += N-1;
 
+    if (UseConcretePath && ZESTSearchHeuristic == Branches &&
+        state.seedingTTL) {
+      --state.seedingTTL;
+      if (0 == state.seedingTTL) {
+        // can we be sure the state is not 'new'? If so we could directly
+        // disable
+        // seeding. For now stay safe
+        state.markForDeletion = true;
+        return;
+      }
+    }
+
     // XXX do proper balance or keep random?
     result.push_back(&state);
     for (unsigned i=1; i<N; ++i) {
@@ -715,7 +822,7 @@ void Executor::branch(ExecutionState &state,
   
   std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
     seedMap.find(&state);
-  if (it != seedMap.end()) {
+  if (it != seedMap.end() && it->second.size()) {
     std::vector<SeedInfo> seeds = it->second;
     seedMap.erase(it);
 
@@ -740,10 +847,29 @@ void Executor::branch(ExecutionState &state,
       // (the seed will be patched).
       if (i==N)
         i = theRNG.getInt32() % N;
+      // this is an error in UseConcretePath mode
+      assert(i != N || !UseConcretePath);
 
       // Extra check in case we're replaying seeds with a max-fork
       if (result[i])
         seedMap[result[i]].push_back(*siit);
+    }
+
+    if (PatchCheckBefore && state.inPatch)
+      addSensitiveInstruction(*result[0]);
+    for (unsigned i = 0; i < N; ++i) {
+      if (result[i] && !seedMap.count(result[i]) && stage == ZEST) {
+        if (ZESTSearchHeuristic == Instructions) {
+          instructionToState.insert(
+              std::pair<int, ExecutionState *>(stats::instructions, result[i]));
+        } else {
+          instructionToState.insert(
+              std::pair<int, ExecutionState *>(result[i]->depth, result[i]));
+        }
+        // branch timing
+        topLevelBranchTimes.push_back(0.0);
+        result[i]->branchTime = &topLevelBranchTimes.back();
+      }
     }
 
     if (OnlyReplaySeeds) {
@@ -761,12 +887,26 @@ void Executor::branch(ExecutionState &state,
       addConstraint(*result[i], conditions[i]);
 }
 
+#define DEBUG_FORK 0
+
 Executor::StatePair 
 Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
   Solver::Validity res;
   std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
     seedMap.find(&current);
-  bool isSeeding = it != seedMap.end();
+
+  std::string currentLocation;
+  if ((pathWriter || symPathWriter) && !isInternal) {
+    std::stringstream sstm;
+    sstm << currentInstructionInfo->file << ":" << currentInstructionInfo->line
+         << std::endl;
+    currentLocation = sstm.str();
+  }
+
+  bool isSeeding = (it != seedMap.end() && !it->second.empty());
+#if DEBUG_FORK
+  std::cout << "fork internal: " << isInternal << " " << condition << std::endl;
+#endif
 
   if (!isSeeding && !isa<ConstantExpr>(condition) && 
       (MaxStaticForkPct!=1. || MaxStaticSolvePct != 1. ||
@@ -799,12 +939,45 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
   if (isSeeding)
     timeout *= it->second.size();
   solver->setTimeout(timeout);
-  bool success = solver->evaluate(current, condition, res);
+  bool success = solver->evaluate(current, condition, res, \
+                                           !current.symbexEnabled);
   solver->setTimeout(0);
   if (!success) {
-    current.pc = current.prevPC;
-    terminateStateEarly(current, "Query timed out (fork).");
-    return StatePair(0, 0);
+    // in zest mode follow the concrete path (if there is one).
+    // current.symbexEnabled should always be true here. remove it?
+    if (UseConcretePath && isSeeding && current.symbexEnabled) {
+      solver->setTimeout(timeout);
+      success = solver->evaluate(current, condition, res, 1);
+      solver->setTimeout(0);
+    }
+    if (!success) {
+      current.pc = current.prevPC;
+      terminateStateEarly(current, "Query timed out (fork).");
+      return StatePair(0, 0);
+    }
+  }
+
+  if (res != Solver::True && res != Solver::False) {
+    // the fork can be taken both ways. however, if TTL == 1 this also means the
+    // state should
+    // be destroyed. We still need to return the state on the seed path, in case
+    // this is
+    // the seed path
+    if (UseConcretePath && ZESTSearchHeuristic == Branches && !isInternal) {
+      assert(current.seedingTTL &&
+             "state with TTL=0 cannot be forked both ways");
+      --current.seedingTTL;
+      if (0 == current.seedingTTL) {
+        // can we be sure the state is not 'new'? If so we could directly
+        // disable
+        // seeding. For now stay safe
+        current.markForDeletion = true;
+
+        solver->setTimeout(timeout);
+        success = solver->evaluate(current, condition, res, 1);
+        solver->setTimeout(0);
+      }
+    }
   }
 
   if (!isSeeding) {
@@ -859,6 +1032,7 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
   // Fix branch in only-replay-seed mode, if we don't have both true
   // and false seeds.
   if (isSeeding && 
+      !current.symbexEnabled &&
       (current.forkDisabled || OnlyReplaySeeds) && 
       res == Solver::Unknown) {
     bool trueSeed=false, falseSeed=false;
@@ -897,17 +1071,29 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
   if (res==Solver::True) {
     if (!isInternal) {
       if (pathWriter) {
-        current.pathOS << "1";
+        current.pathOS << "1 " << currentLocation;
       }
     }
+
+    if (UseConcretePath)
+      addConstraint(current, condition);
+#if DEBUG_FORK
+      std::cout << "fork ends2" << std::endl;
+#endif
 
     return StatePair(&current, 0);
   } else if (res==Solver::False) {
     if (!isInternal) {
       if (pathWriter) {
-        current.pathOS << "0";
+        current.pathOS << "0 " << currentLocation;
       }
     }
+
+    if (UseConcretePath)
+      addConstraint(current, Expr::createIsZero(condition));
+#if DEBUG_FORK
+      std::cout << "fork ends3" << std::endl;
+#endif
 
     return StatePair(0, &current);
   } else {
@@ -918,6 +1104,13 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
 
     falseState = trueState->branch();
     addedStates.push_back(falseState);
+
+    if (PatchCheckBefore && current.inPatch)
+      addSensitiveInstruction(*falseState);
+
+    if (RandomizeFork && theRNG.getBool())
+      std::swap(trueState, falseState);
+
 
     if (it != seedMap.end()) {
       std::vector<SeedInfo> seeds = it->second;
@@ -941,11 +1134,43 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
       bool swapInfo = false;
       if (trueSeeds.empty()) {
         if (&current == trueState) swapInfo = true;
-        seedMap.erase(trueState);
+        if (stage == ZEST) {
+          if (trueState->nextForkInterleaved) {
+            trueState->nextForkInterleaved = falseState->nextForkInterleaved =
+                false;
+          } else {
+            seedMap.erase(trueState);
+            if (ZESTSearchHeuristic == Instructions)
+              instructionToState.insert(std::pair<int, ExecutionState *>(
+                  stats::instructions, trueState));
+            else
+              instructionToState.insert(std::pair<int, ExecutionState *>(
+                  trueState->depth, trueState));
+          }
+          // branch timing
+          topLevelBranchTimes.push_back(0.0);
+          trueState->branchTime = &topLevelBranchTimes.back();
+        }        
       }
       if (falseSeeds.empty()) {
         if (&current == falseState) swapInfo = true;
-        seedMap.erase(falseState);
+        if (stage == ZEST) {
+          if (trueState->nextForkInterleaved) {
+            trueState->nextForkInterleaved = falseState->nextForkInterleaved =
+                false;
+          } else {
+            seedMap.erase(falseState);
+            if (ZESTSearchHeuristic == Instructions)
+              instructionToState.insert(std::pair<int, ExecutionState *>(
+                  stats::instructions, falseState));
+            else
+              instructionToState.insert(std::pair<int, ExecutionState *>(
+                  falseState->depth, falseState));
+          }
+          // branch timing
+          topLevelBranchTimes.push_back(0.0);
+          falseState->branchTime = &topLevelBranchTimes.back();
+        }
       }
       if (swapInfo) {
         std::swap(trueState->coveredNew, falseState->coveredNew);
@@ -962,13 +1187,13 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
     if (!isInternal) {
       if (pathWriter) {
         falseState->pathOS = pathWriter->open(current.pathOS);
-        trueState->pathOS << "1";
-        falseState->pathOS << "0";
+        trueState->pathOS << "1 " << currentLocation;
+        falseState->pathOS << "0 " << currentLocation;
       }      
       if (symPathWriter) {
         falseState->symPathOS = symPathWriter->open(current.symPathOS);
-        trueState->symPathOS << "1";
-        falseState->symPathOS << "0";
+        trueState->symPathOS << "1 " << currentLocation;
+        falseState->symPathOS << "0 " << currentLocation;
       }
     }
 
@@ -982,17 +1207,25 @@ Executor::fork(ExecutionState &current, ref<Expr> condition, bool isInternal) {
       return StatePair(0, 0);
     }
 
+#if DEBUG_FORK
+    std::cout << "fork ends4" << std::endl;
+#endif
     return StatePair(trueState, falseState);
   }
 }
 
+unsigned long addConstraintTime;
+unsigned constraintsAdded;
 void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
+  constraintsAdded++;
   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(condition)) {
     if (!CE->isTrue())
       llvm::report_fatal_error("attempt to add invalid constraint");
     return;
   }
 
+  sys::TimeValue now(0, 0), user(0, 0), delta(0, 0), sys(0, 0);
+  
   // Check to see if this constraint violates seeds.
   std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
     seedMap.find(&state);
@@ -1014,10 +1247,14 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
       klee_warning("seeds patched for violating constraint"); 
   }
 
+  sys::Process::GetTimeUsage(now, user, sys);
   state.addConstraint(condition);
+  sys::Process::GetTimeUsage(delta, user, sys);
   if (ivcEnabled)
     doImpliedValueConcretization(state, condition, 
                                  ConstantExpr::alloc(1, Expr::Bool));
+  delta -= now;
+  addConstraintTime += delta.usec();
 }
 
 ref<klee::ConstantExpr> Executor::evalConstant(const Constant *c) {
@@ -1086,6 +1323,12 @@ const Cell& Executor::eval(KInstruction *ki, unsigned index,
   assert(index < ki->inst->getNumOperands());
   int vnumber = ki->operands[index];
 
+  if (vnumber == -1) {
+    llvm::errs() << "Invalid eval in " << currentInstructionInfo->assemblyLine
+              << " " << currentInstructionInfo->file << ":"
+              << currentInstructionInfo->line << "\n";
+  }
+
   assert(vnumber != -1 &&
          "Invalid operand to eval(), not a value or constant!");
 
@@ -1111,16 +1354,17 @@ void Executor::bindArgument(KFunction *kf, unsigned index,
 }
 
 ref<Expr> Executor::toUnique(const ExecutionState &state, 
-                             ref<Expr> &e) {
+                             ref<Expr> &e, bool symbexUsesSeeds) {
   ref<Expr> result = e;
 
   if (!isa<ConstantExpr>(e)) {
     ref<ConstantExpr> value;
     bool isTrue = false;
 
+    bool useSeeds = (symbexUsesSeeds || !state.symbexEnabled);
     solver->setTimeout(coreSolverTimeout);      
-    if (solver->getValue(state, e, value) &&
-        solver->mustBeTrue(state, EqExpr::create(e, value), isTrue) &&
+    if (solver->getValue(state, e, value, useSeeds) &&
+        solver->mustBeTrue(state, EqExpr::create(e, value), isTrue, useSeeds) &&
         isTrue)
       result = value;
     solver->setTimeout(0);
@@ -1167,7 +1411,7 @@ void Executor::executeGetValue(ExecutionState &state,
   e = state.constraints.simplifyExpr(e);
   std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
     seedMap.find(&state);
-  if (it==seedMap.end() || isa<ConstantExpr>(e)) {
+  if (it==seedMap.end() || isa<ConstantExpr>(e) || UseConcretePath) {
     ref<ConstantExpr> value;
     bool success = solver->getValue(state, e, value);
     assert(success && "FIXME: Unhandled solver failure");
@@ -1193,13 +1437,15 @@ void Executor::executeGetValue(ExecutionState &state,
     std::vector<ExecutionState*> branches;
     branch(state, conditions, branches);
     
-    std::vector<ExecutionState*>::iterator bit = branches.begin();
-    for (std::set< ref<Expr> >::iterator vit = values.begin(), 
-           vie = values.end(); vit != vie; ++vit) {
-      ExecutionState *es = *bit;
-      if (es)
-        bindLocal(target, *es, *vit);
-      ++bit;
+    if (!state.markForDeletion) {
+      std::vector<ExecutionState*>::iterator bit = branches.begin();
+      for (std::set< ref<Expr> >::iterator vit = values.begin(), 
+             vie = values.end(); vit != vie; ++vit) {
+        ExecutionState *es = *bit;
+        if (es)
+          bindLocal(target, *es, *vit);
+        ++bit;
+      }
     }
   }
 }
@@ -1514,6 +1760,12 @@ static inline const llvm::fltSemantics * fpWidthToSemantics(unsigned width) {
 
 void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
   Instruction *i = ki->inst;
+  /*
+    if (stats::instructions > 452195 ) {
+      printFileLine(state, ki);
+      std::cerr << "@" << ki->info->assemblyLine << std::endl;
+    }
+  */
   switch (i->getOpcode()) {
     // Control flow
   case Instruction::Ret: {
@@ -1635,7 +1887,11 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     ref<Expr> cond = eval(ki, 0, state).value;
     BasicBlock *bb = si->getParent();
 
-    cond = toUnique(state, cond);
+    ref<Expr> ocond;
+    if (UseConcretePath)
+      ocond = cond;
+
+    cond = toUnique(state, cond, false);
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(cond)) {
       // Somewhat gross to create these all the time, but fine till we
       // switch to an internal rep.
@@ -1647,8 +1903,32 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 #else
       unsigned index = si->findCaseValue(ci);
 #endif
+
+      if (UseConcretePath) {
+        if (index) { // not default
+          addConstraint(state, EqExpr::create(ocond, cond));
+        } else {
+          ref<Expr> isDefault = ConstantExpr::alloc(1, Expr::Bool);
+#if LLVM_VERSION_CODE >= LLVM_VERSION(3, 1)
+          for (SwitchInst::CaseIt it = si->case_begin(), itE = si->case_end();
+               it != itE; ++it) {
+            ref<Expr> value = evalConstant(it.getCaseValue());
+#else
+          for (unsigned i = 1, cases = si->getNumCases(); i < cases; ++i) {
+            ref<Expr> value = evalConstant(si->getCaseValue(i));
+#endif
+            ref<Expr> match = EqExpr::create(ocond, value);
+            isDefault = AndExpr::create(isDefault, Expr::createIsZero(match));
+          }
+          addConstraint(state, isDefault);
+        }
+      }
+
       transferToBasicBlock(si->getSuccessor(index), si->getParent(), state);
     } else {
+      assert((!UseConcretePath || state.symbexEnabled) &&
+             "non-constant switch condition in Zest mode");
+
       // Handle possible different branch targets
 
       // We have the following assumptions:
@@ -1694,7 +1974,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
         // Check if control flow could take this case
         bool result;
-        bool success = solver->mayBeTrue(state, match, result);
+        bool success = solver->mayBeTrue(state, match, result, false);
         assert(success && "FIXME: Unhandled solver failure");
         (void) success;
         if (result) {
@@ -1721,7 +2001,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
       // Check if control could take the default case
       bool res;
-      bool success = solver->mayBeTrue(state, defaultValue, res);
+      bool success = solver->mayBeTrue(state, defaultValue, res, false);
       assert(success && "FIXME: Unhandled solver failure");
       (void) success;
       if (res) {
@@ -1744,15 +2024,17 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       std::vector<ExecutionState*> branches;
       branch(state, conditions, branches);
 
-      std::vector<ExecutionState*>::iterator bit = branches.begin();
-      for (std::vector<BasicBlock *>::iterator it = bbOrder.begin(),
-                                               ie = bbOrder.end();
-           it != ie; ++it) {
-        ExecutionState *es = *bit;
-        if (es)
-          transferToBasicBlock(*it, bb, *es);
-        ++bit;
-      }
+      if (!state.markForDeletion) {
+      	std::vector<ExecutionState*>::iterator bit = branches.begin();
+      	for (std::vector<BasicBlock *>::iterator it = bbOrder.begin(),
+           	                                   	 ie = bbOrder.end();
+           	it != ie; ++it) {
+        	ExecutionState *es = *bit;
+        	if (es)
+          	transferToBasicBlock(*it, bb, *es);
+        	++bit;
+      	}
+    	}
     }
     break;
  }
@@ -1827,6 +2109,24 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
           }
             
           i++;
+        }
+      }
+    }
+    if (f) {
+/* check for a call to exit and keep the return value. should also check for
+ * _exit? */
+#if LLVM_VERSION_CODE >= LLVM_VERSION(3, 1)
+      if (f->getName().str() == "exit" && arguments.size() > 0) {
+#else
+      if (f->getNameStr() == "exit" && arguments.size() > 0) {
+#endif
+        ConstantExpr *returnCode = dyn_cast<ConstantExpr>(arguments[0]);
+        if (returnCode) {
+          programExitCode = (int32_t)returnCode->getZExtValue();
+        } else {
+          /* we could do more, e.g., check if 0 is a possible value. should be
+           * constant though */
+          klee_warning("Calling exit with a symbolic value\n");
         }
       }
 
@@ -2678,6 +2978,19 @@ void Executor::checkMemoryUsage() {
   }
 }
 
+// This is a hack to make the first open() call in a user program return 3 (see
+// test/Feature/FDNumbers.c).  Should be called after reserveFirstFDs().
+void Executor::closeFirstFds(void) {
+  if (!ReserveFds)
+    return;
+
+  for (int i = 3; i < 3 + N_RESERVED_FDS; i++) {
+    int r = close(i);
+    assert(r == 0);
+  }
+}
+
+
 void Executor::doDumpStates() {
   if (!DumpStatesOnHalt || states.empty())
     return;
@@ -2699,22 +3012,46 @@ void Executor::run(ExecutionState &initialState) {
   // optimization and such.
   initTimers();
 
+  stage = ZEST;
+  if (PatchCheckBefore) {
+    if (!PatchManualBranch) {
+      SymbexEvery = 1;
+      SymbexFor = 10;
+    }
+    ZESTSearchHeuristic = Branches;
+  }
+
   states.insert(&initialState);
 
-  if (usingSeeds) {
+  int maxDepth = 0;
+  if (usingSeeds || UseConcretePath) {
     std::vector<SeedInfo> &v = seedMap[&initialState];
     
-    for (std::vector<KTest*>::const_iterator it = usingSeeds->begin(), 
-           ie = usingSeeds->end(); it != ie; ++it)
-      v.push_back(SeedInfo(*it));
+    if (UseConcretePath) {
+      // Use a dummy seed. In zest mode, klee_make_symbolic determines 'seed'
+      // values from the actual variables
+      v.push_back(SeedInfo(NULL));
 
-    int lastNumSeeds = usingSeeds->size()+10;
+      // Also force following only the concrete path
+      // OnlyReplaySeeds = true;
+    } else {
+      for (std::vector<KTest*>::const_iterator it = usingSeeds->begin(), 
+             ie = usingSeeds->end(); it != ie; ++it)
+        v.push_back(SeedInfo(*it));
+    }
+
+    int lastNumSeeds = (UseConcretePath ? 10 : usingSeeds->size()+10);
     double lastTime, startTime = lastTime = util::getWallTime();
     ExecutionState *lastState = 0;
     while (!seedMap.empty()) {
       if (haltExecution) {
-        doDumpStates();
-        return;
+        if (UseConcretePath) {
+          haltExecution = false;
+          goto search;
+        } else {
+          doDumpStates();
+          return;
+        }
       }
 
       std::map<ExecutionState*, std::vector<SeedInfo> >::iterator it = 
@@ -2725,11 +3062,44 @@ void Executor::run(ExecutionState &initialState) {
       unsigned numSeeds = it->second.size();
       ExecutionState &state = *lastState;
       KInstruction *ki = state.pc;
+      currentInstructionInfo = ki->info;
       stepInstruction(state);
 
       executeInstruction(state, ki);
+
+      if (ki->inst->getOpcode() == Instruction::GetElementPtr)
+        state.lastInstructionGEP = true;
+      else
+        state.lastInstructionGEP = false;
+      maxDepth = state.depth;
+
       processTimers(&state, MaxInstructionTime * numSeeds);
+      int currentTerminated = 
+              (std::find(removedStates.begin(), removedStates.end(), &state) != 
+               removedStates.end());
       updateStates(&state);
+
+      currentInstructionInfo = NULL;
+      if (currentTerminated)
+        continue;
+      // some checks below could be simplified because the seed path is executed
+      // first. don't bother yet
+      if (UseConcretePath) {
+        if (state.markForDeletion) {
+          disableSeeding(state);
+          updateStates(&state);
+          continue;
+        }
+        if (SymbexEvery && stats::instructions % SymbexEvery == 0 &&
+            seedMap.size() == 1)
+          enableSeeding(state, SymbexFor);
+
+        if (ZESTSearchHeuristic == Instructions && state.seedingTTL > 0) {
+          if (!(--state.seedingTTL)) {
+            disableSeeding(state);
+          }
+        }
+      }
 
       if ((stats::instructions % 1000) == 0) {
         int numSeeds = 0, numStates = 0;
@@ -2748,13 +3118,20 @@ void Executor::run(ExecutionState &initialState) {
                    time >= lastTime+10) {
           lastTime = time;
           lastNumSeeds = numSeeds;          
-          klee_message("%d seeds remaining over: %d states", 
-                       numSeeds, numStates);
+          klee_message("%d seeds remaining over: %d states; %lu sec. add "
+                       "constaint time after %u constrains (%d actual)",
+                       numSeeds, numStates, addConstraintTime / 1000000,
+                       constraintsAdded, (int)state.constraints.size());
         }
       }
     }
 
     klee_message("seeding done (%d states remain)", (int) states.size());
+
+    klee_message("found %d sensitive instructions", (int)sensitiveInst.size());
+    klee_message("executed %d instructions up to depth %d",
+                 (int)stats::instructions, maxDepth);
+    stage = Concolic;
 
     // XXX total hack, just because I like non uniform better but want
     // seed results to be equally weighted.
@@ -2770,18 +3147,52 @@ void Executor::run(ExecutionState &initialState) {
     }
   }
 
+search:
   searcher = constructUserSearcher(*this);
 
+  // klee timers have 0.1s resolution, unsuitable for inst execution time
+  double stateStartTime, stateEndTime;
+ 
   std::vector<ExecutionState *> newStates(states.begin(), states.end());
   searcher->update(0, newStates, std::vector<ExecutionState *>());
 
   while (!states.empty() && !haltExecution) {
     ExecutionState &state = searcher->selectState();
+
+    if (state.markForDeletion || (LESTMaxBranchTime > 0 && state.branchTime &&
+                                  *state.branchTime > LESTMaxBranchTime)) {
+      disableSeeding(state);
+      updateStates(&state);
+      continue;
+    }
+
     KInstruction *ki = state.pc;
+
+    currentInstructionInfo = ki->info;
+    stateStartTime = util::getWallTime();
+
     stepInstruction(state);
 
     executeInstruction(state, ki);
+    
+    currentInstructionInfo = NULL;
+    // XXX temporary patch introduced to solve memory problems found by valgrind
+    // on Zesti test suite
+    // --lest-max-branch-time will not work
+    if (UseConcretePath && LESTMaxBranchTime > 0) {
+      stateEndTime = util::getWallTime();
+      *state.branchTime = *state.branchTime + (stateEndTime - stateStartTime);
+    }
+
     processTimers(&state, MaxInstructionTime);
+
+    if (ZESTSearchHeuristic == Instructions && UseConcretePath && SymbexEvery &&
+        SymbexFor) {
+      assert(state.seedingTTL > 0);
+      if (!(--state.seedingTTL)) {
+        disableSeeding(state);
+      }
+    }
 
     checkMemoryUsage();
 
@@ -2866,6 +3277,17 @@ void Executor::terminateState(ExecutionState &state) {
       seedMap.erase(it3);
     addedStates.erase(it);
     processTree->remove(state.ptreeNode);
+
+    std::multimap<int, ExecutionState *>::iterator itm, itme;
+    if (UseConcretePath) {
+      for (itm = instructionToState.begin(), itme = instructionToState.end();
+           itm != itme; ++itm)
+        if (itm->second == &state) {
+          instructionToState.erase(itm);
+          break;
+        }
+    }
+
     delete &state;
   }
 }
@@ -2940,6 +3362,10 @@ bool Executor::shouldExitOn(enum TerminateReason termReason) {
   return false;
 }
 
+// from the ZESTSearcher
+extern int currentDistance;
+extern int _baseInstruction;
+
 void Executor::terminateStateOnError(ExecutionState &state,
                                      const llvm::Twine &messaget,
                                      enum TerminateReason termReason,
@@ -2963,6 +3389,19 @@ void Executor::terminateStateOnError(ExecutionState &state,
     std::string MsgString;
     llvm::raw_string_ostream msg(MsgString);
     msg << "Error: " << message << "\n";
+    
+    msg << "After " << statsTracker->elapsed() << "s"
+        << "\n";
+    if (UseConcretePath) {
+      msg << "SE started at depth/instruction " << _baseInstruction << "\n";
+      msg << "Current depth " << state.depth << "\n";
+      msg << "Current instructions " << stats::instructions << "\n";
+      msg << "Current searcherdistance " << currentDistance << "\n";
+      msg << "Current TTL " << state.seedingTTL << "\n";
+    } else {
+      msg << "Current depth " << state.depth << "\n";
+    }
+
     if (ii.file != "") {
       msg << "File: " << ii.file << "\n";
       msg << "Line: " << ii.line << "\n";
@@ -3046,12 +3485,49 @@ void Executor::callExternalFunction(ExecutionState &state,
     }
   }
 
+  // make sure externals are called with the right arguments
+  // this is expensive but given that it's done rarely it should be fine
+  // the alternative (tracking the concrete store across load/stores) is
+  // messy and may be more expensive
+  // XXX external side-effects (e.g., errno) are (still) not propagated to the
+  // program
+  if (isOnConcretePath(state)) {
+    std::vector<unsigned char> concrete;
+    for (MemoryMap::iterator it = state.addressSpace.objects.begin(),
+                             ie = state.addressSpace.objects.end();
+         it != ie; ++it) {
+      const MemoryObject *mo = it->first;
+      if (!mo->isUserSpecified) {
+        ObjectState *os = it->second;
+        if (os->isConcrete())
+          continue;
+        concrete.clear();
+        for (unsigned int idx = 0; idx < os->size; ++idx) {
+          ref<ConstantExpr> value;
+          ref<Expr> val = os->read8(idx);
+
+          bool success = solver->getValue(state, val, value);
+          assert(success && "FIXME: Unhandled solver failure");
+          (void)success;
+          if (ConstantExpr *CE = dyn_cast<ConstantExpr>(value)) {
+            concrete.push_back(CE->getZExtValue(8));
+          }
+        }
+        if (os->size == concrete.size() && !os->readOnly) {
+          ObjectState *wos = state.addressSpace.getWriteable(mo, os);
+          wos->initializeToValue(concrete);
+        }
+      }
+    }
+  }
+
   state.addressSpace.copyOutConcretes();
 
   if (!SuppressExternalWarnings) {
 
     std::string TmpStr;
     llvm::raw_string_ostream os(TmpStr);
+    const InstructionInfo &ii = *state.prevPC->info;
     os << "calling external: " << function->getName().str() << "(";
     for (unsigned i=0; i<arguments.size(); i++) {
       os << arguments[i];
@@ -3059,6 +3535,7 @@ void Executor::callExternalFunction(ExecutionState &state,
 	os << ", ";
     }
     os << ")";
+    os << " at " << ii.file.c_str() << ":" << ii.line;
     
     if (AllExternalWarnings)
       klee_warning("%s", os.str().c_str());
@@ -3139,8 +3616,15 @@ void Executor::executeAlloc(ExecutionState &state,
                             KInstruction *target,
                             bool zeroMemory,
                             const ObjectState *reallocFrom) {
+  ref<Expr> osize;
+  if (UseConcretePath)
+    osize = size;
+
   size = toUnique(state, size);
   if (ConstantExpr *CE = dyn_cast<ConstantExpr>(size)) {
+    if (UseConcretePath && !dyn_cast<ConstantExpr>(osize)) {
+      addConstraint(state, EqExpr::create(osize, size));
+    }
     MemoryObject *mo = memory->allocate(CE->getZExtValue(), isLocal, false, 
                                         state.prevPC->inst);
     if (!mo) {
@@ -3300,6 +3784,23 @@ void Executor::resolveExact(ExecutionState &state,
   }
 }
 
+void Executor::addSensitiveInstruction(const ExecutionState &state) {
+  if (Concolic == stage)
+    return;
+  if (ZESTSearchHeuristic == Instructions) {
+    sensitiveInst.push_back(stats::instructions);
+    klee_message_to_file(
+        "Sensitive instruction #%d @ %s:%d", (int)stats::instructions,
+        currentInstructionInfo->file.c_str(), currentInstructionInfo->line);
+  } else if (sensitiveInst.empty() ||
+             sensitiveInst.back() != (int)state.depth) {
+    sensitiveInst.push_back(state.depth);
+    klee_message_to_file("Sensitive instruction (depth %d) @ %s:%d",
+                         (int)state.depth, currentInstructionInfo->file.c_str(),
+                         currentInstructionInfo->line);
+   }
+ }
+
 void Executor::executeMemoryOperation(ExecutionState &state,
                                       bool isWrite,
                                       ref<Expr> address,
@@ -3309,12 +3810,17 @@ void Executor::executeMemoryOperation(ExecutionState &state,
                      getWidthForLLVMType(target->inst->getType()));
   unsigned bytes = Expr::getMinBytesForWidth(type);
 
+  // XXX need to take care of this in ZEST
   if (SimplifySymIndices) {
     if (!isa<ConstantExpr>(address))
       address = state.constraints.simplifyExpr(address);
     if (isWrite && !isa<ConstantExpr>(value))
       value = state.constraints.simplifyExpr(value);
   }
+
+  // when using concrete-path, overwrite the address with the concrete value but
+  // keep the symbolic
+  // expr for bounds checking
 
   // fast path: single in-bounds resolution
   ObjectPair op;
@@ -3334,12 +3840,34 @@ void Executor::executeMemoryOperation(ExecutionState &state,
     }
     
     ref<Expr> offset = mo->getOffsetExpr(address);
+    
+    // bounds check
+    ref<Expr> boundsCheck = mo->getBoundsCheckOffset(offset, bytes);
+
+    if (isOnConcretePath(state) && !PatchCheckBefore) {
+      // remember the instruction if it is sensitive
+      if (EveryAccessIsSensitive || state.lastInstructionGEP ||
+          !dyn_cast<ConstantExpr>(boundsCheck)) {
+        addSensitiveInstruction(state);
+      }
+    }
 
     bool inBounds;
+    
+    if (true == UseConcretePath) {
+      doLog = 1;
+    }
+    bool useSeeds = ZestSkipChecks || (PatchCheckBefore && !state.inPatch);
+
     solver->setTimeout(coreSolverTimeout);
     bool success = solver->mustBeTrue(state, 
                                       mo->getBoundsCheckOffset(offset, bytes),
-                                      inBounds);
+                                      inBounds, useSeeds);
+  
+    if (true == UseConcretePath) {
+      doLog = 0;
+    }
+
     solver->setTimeout(0);
     if (!success) {
       state.pc = state.prevPC;
@@ -3349,6 +3877,12 @@ void Executor::executeMemoryOperation(ExecutionState &state,
 
     if (inBounds) {
       const ObjectState *os = op.second;
+
+      if (MaxSymArraySize && mo->size >= MaxSymArraySize) {
+        address = toConstant(state, address, "max-sym-array-size");
+        offset = mo->getOffsetExpr(address);
+      }
+
       if (isWrite) {
         if (os->readOnly) {
           terminateStateOnError(state, "memory error: object read only",
@@ -3387,11 +3921,23 @@ void Executor::executeMemoryOperation(ExecutionState &state,
     const ObjectState *os = i->second;
     ref<Expr> inBounds = mo->getBoundsCheckPointer(address, bytes);
     
+    bool symbex = unbound->symbexEnabled;
+    enableSeeding(*unbound, 1);
+
     StatePair branches = fork(*unbound, inBounds, true);
+
+    if (branches.first)
+      branches.first->symbexEnabled = symbex;
+    if (branches.second)
+      branches.second->symbexEnabled = symbex;
+
     ExecutionState *bound = branches.first;
 
     // bound can be 0 on failure or overlapped 
     if (bound) {
+      if (MaxSymArraySize && mo->size >= MaxSymArraySize) {
+        address = toConstant(state, address, "max-sym-array-size");
+      }
       if (isWrite) {
         if (os->readOnly) {
           terminateStateOnError(*bound, "memory error: object read only",
@@ -3416,10 +3962,43 @@ void Executor::executeMemoryOperation(ExecutionState &state,
     if (incomplete) {
       terminateStateEarly(*unbound, "Query timed out (resolve).");
     } else {
-      terminateStateOnError(*unbound, "memory error: out of bound pointer", Ptr,
-                            NULL, getAddressInfo(*unbound, address));
+      terminateStateOnError(
+               *unbound, 
+               (isOnConcretePath(*unbound)
+               		? "memory error: out of bound pointer on the concrete path"
+               		: "memory error: out of bound pointer"),
+               Ptr, NULL, getAddressInfo(*unbound, address));
     }
   }
+}
+
+std::vector<unsigned char>
+Executor::readObjectAtAddress(ExecutionState &state, ref<Expr> addressExpr) {
+  ObjectPair op;
+  addressExpr = toUnique(state, addressExpr);
+  ref<ConstantExpr> address = cast<ConstantExpr>(addressExpr);
+  if (!state.addressSpace.resolveOne(address, op))
+    assert(0 && "XXX out of bounds / multiple resolution unhandled");
+  bool res;
+  assert(solver->mustBeTrue(
+             state, EqExpr::create(address, op.first->getBaseExpr()), res) &&
+         res && "XXX interior pointer unhandled");
+  const MemoryObject *mo = op.first;
+  const ObjectState *os = op.second;
+
+  char buf;
+  std::vector<unsigned char> result;
+  unsigned i;
+  for (i = 0; i < mo->size; i++) {
+    ref<Expr> cur = os->read8(i);
+    cur = toUnique(state, cur);
+    assert(isa<ConstantExpr>(cur) &&
+           "hit symbolic byte while reading concrete object");
+    buf = cast<ConstantExpr>(cur)->getZExtValue(8);
+    result.push_back(buf);
+  }
+
+  return result;
 }
 
 void Executor::executeMakeSymbolic(ExecutionState &state, 
@@ -3427,6 +4006,13 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
                                    const std::string &name) {
   // Create a new object state for the memory object (instead of a copy).
   if (!replayKTest) {
+    std::vector<unsigned char> prevVal;
+    if (UseConcretePath) {
+      prevVal = readObjectAtAddress(
+          state,
+          ConstantExpr::create(mo->address, Context::get().getPointerWidth()));
+    }
+
     // Find a unique name for this array.  First try the original name,
     // or if that fails try adding a unique identifier.
     unsigned id = 0;
@@ -3445,6 +4031,11 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
       for (std::vector<SeedInfo>::iterator siit = it->second.begin(), 
              siie = it->second.end(); siit != siie; ++siit) {
         SeedInfo &si = *siit;
+        
+        if (UseConcretePath) {
+          si.assignment.bindings[array] = prevVal;
+        } else {
+        
         KTestObject *obj = si.getNextInput(mo, NamedSeedMatching);
 
         if (!obj) {
@@ -3480,6 +4071,7 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
           }
         }
       }
+      } // UseConcretePath
     }
   } else {
     ObjectState *os = bindObjectInState(state, mo, false);
@@ -3499,7 +4091,7 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
 
 /***/
 
-void Executor::runFunctionAsMain(Function *f,
+int Executor::runFunctionAsMain(Function *f,
 				 int argc,
 				 char **argv,
 				 char **envp) {
@@ -3588,6 +4180,7 @@ void Executor::runFunctionAsMain(Function *f,
 
   processTree = new PTree(state);
   state->ptreeNode = processTree->root;
+  closeFirstFds();
   run(*state);
   delete processTree;
   processTree = 0;
@@ -3601,6 +4194,8 @@ void Executor::runFunctionAsMain(Function *f,
 
   if (statsTracker)
     statsTracker->done();
+
+  return programExitCode;
 }
 
 unsigned Executor::getPathStreamID(const ExecutionState &state) {
@@ -3747,6 +4342,45 @@ Expr::Width Executor::getWidthForLLVMType(LLVM_TYPE_Q llvm::Type *type) const {
   return kmodule->targetData->getTypeSizeInBits(type);
 }
 
+
+void Executor::enableSeeding(ExecutionState &state, unsigned TTL,
+                             int interleave) {
+  state.symbexEnabled = true;
+  state.markForDeletion = false;
+  state.seedingTTL = TTL;
+  state.nextForkInterleaved = (interleave ? true : false);
+}
+
+void Executor::disableSeeding(ExecutionState &state) {
+  state.symbexEnabled = false;
+  state.markForDeletion = false;
+  state.nextForkInterleaved = false;
+  if (UseConcretePath) {
+    std::map<ExecutionState *, std::vector<SeedInfo> >::iterator it =
+        seedMap.find(&state);
+    if (it != seedMap.end()) {
+      std::vector<SeedInfo> seeds = it->second;
+      if (seeds.empty()) {
+        terminateState(state);
+        seedMap.erase(it);
+      }
+    } else {
+      terminateState(state);
+    }
+  }
+}
+
+bool Executor::isOnConcretePath(ExecutionState &state) {
+  bool onConcretePath = false;
+  if (UseConcretePath) {
+    std::map<ExecutionState *, std::vector<SeedInfo> >::iterator its =
+        seedMap.find(&state);
+    if (its != seedMap.end() && its->second.size()) {
+      onConcretePath = true;
+    }
+  }
+  return onConcretePath;
+}
 ///
 
 Interpreter *Interpreter::create(const InterpreterOptions &opts,

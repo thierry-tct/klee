@@ -23,6 +23,13 @@
 
 using namespace klee;
 
+using namespace llvm;
+
+namespace {
+cl::opt<bool> SimpleConstraintManagement("simple-constraint-management",
+                                         cl::init(false));
+}
+
 namespace {
   llvm::cl::opt<bool>
   RewriteEqualities("rewrite-equalities",
@@ -86,7 +93,7 @@ bool ConstraintManager::rewriteConstraints(ExprVisitor &visitor) {
     ref<Expr> e = visitor.visit(ce);
 
     if (e!=ce) {
-      addConstraintInternal(e); // enable further reductions
+      addConstraintInternal(e, true); // enable further reductions
       changed = true;
     } else {
       constraints.push_back(ce);
@@ -125,7 +132,7 @@ ref<Expr> ConstraintManager::simplifyExpr(ref<Expr> e) const {
   return ExprReplaceVisitor2(equalities).visit(e);
 }
 
-void ConstraintManager::addConstraintInternal(ref<Expr> e) {
+void ConstraintManager::addConstraintInternal(ref<Expr> e, bool simplify) {
   // rewrite any known equalities and split Ands into different conjuncts
 
   switch (e->getKind()) {
@@ -137,13 +144,13 @@ void ConstraintManager::addConstraintInternal(ref<Expr> e) {
     // split to enable finer grained independence and other optimizations
   case Expr::And: {
     BinaryExpr *be = cast<BinaryExpr>(e);
-    addConstraintInternal(be->left);
-    addConstraintInternal(be->right);
+    addConstraintInternal(be->left, simplify);
+    addConstraintInternal(be->right, simplify);
     break;
   }
 
   case Expr::Eq: {
-    if (RewriteEqualities) {
+    if (simplify) { //if (RewriteEqualities) {
       // XXX: should profile the effects of this and the overhead.
       // traversing the constraints looking for equalities is hardly the
       // slowest thing we do, but it is probably nicer to have a
@@ -166,6 +173,12 @@ void ConstraintManager::addConstraintInternal(ref<Expr> e) {
 }
 
 void ConstraintManager::addConstraint(ref<Expr> e) {
-  e = simplifyExpr(e);
-  addConstraintInternal(e);
+  //e = simplifyExpr(e);
+  //addConstraintInternal(e);
+  addConstraint(e, !SimpleConstraintManagement);
+}
+void ConstraintManager::addConstraint(ref<Expr> e, bool simplify) {
+  if (simplify)
+    e = simplifyExpr(e);
+  addConstraintInternal(e, simplify);
 }

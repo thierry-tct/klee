@@ -61,8 +61,11 @@ namespace {
   UseBumpMerge("use-bump-merge", 
            cl::desc("Enable support for klee_merge() (extra experimental)"));
 
+  cl::opt<bool> UseZESTSearch("use-zest-search");
 }
 
+/* Arg. defined in lib/Core/Executor.cpp. Enables the zest searcher */
+extern unsigned PatchCheckBefore;
 
 bool klee::userSearcherRequiresMD2U() {
   return (std::find(CoreSearch.begin(), CoreSearch.end(), Searcher::NURS_MD2U) != CoreSearch.end() ||
@@ -130,6 +133,11 @@ Searcher *klee::constructUserSearcher(Executor &executor) {
   
   if (UseIterativeDeepeningTimeSearch) {
     searcher = new IterativeDeepeningTimeSearcher(searcher);
+  }
+
+  if (UseZESTSearch || PatchCheckBefore) {
+    searcher =
+        new ZESTSearcher(&executor.instructionToState, &executor.sensitiveInst);
   }
 
   llvm::raw_ostream &os = executor.getHandler().getInfoStream();

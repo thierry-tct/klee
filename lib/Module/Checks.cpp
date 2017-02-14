@@ -157,3 +157,12 @@ bool OvershiftCheckPass::runOnModule(Module &M) {
   }
   return moduleChanged;
 }
+
+char AssertCheckPass::ID = 0;
+
+bool AssertCheckPass::runOnModule(Module &M) {
+  Function *enableSymbexFunction = 0;
+  Function *disableSymbexFunction = 0;
+  bool moduleChanged = false;
+  return moduleChanged;
+}

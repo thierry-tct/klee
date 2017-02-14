@@ -117,6 +117,14 @@ static SpecialFunctionHandler::HandlerInfo handlerInfo[] = {
   add("malloc", handleMalloc, true),
   add("realloc", handleRealloc, true),
 
+  add("klee_enable_symbex", handleEnableSeeding, false),
+  add("klee_disable_symbex", handleDisableSeeding, false),
+  add("klee_patch_begin", handlePatchBegin, false),
+  add("klee_patch_end", handlePatchEnd, false),
+  add("klee_zest_enabled", handleZestEnabled, true),
+  add("zest_skip_checks", handleSkipChecks, false),
+  add("zest_do_checks", handleDoChecks, false),
+
   // operator delete[](void*)
   add("_ZdaPv", handleDeleteArray, false),
   // operator delete(void*)
@@ -403,7 +411,7 @@ void SpecialFunctionHandler::handleAssume(ExecutionState &state,
     e = NeExpr::create(e, ConstantExpr::create(0, e->getWidth()));
   
   bool res;
-  bool success __attribute__ ((unused)) = executor.solver->mustBeFalse(state, e, res);
+  bool success __attribute__ ((unused)) = executor.solver->mustBeFalse(state, e, res, false);
   assert(success && "FIXME: Unhandled solver failure");
   if (res) {
     if (SilentKleeAssume) {
@@ -730,6 +738,9 @@ void SpecialFunctionHandler::handleMakeSymbolic(ExecutionState &state,
     if (res) {
       executor.executeMakeSymbolic(*s, mo, name);
     } else {      
+      llvm::errs() << "wrong size given to klee_make_symbolic: " << arguments[1]
+                   << " (given), " << mo->getSizeExpr() << " (expected)"
+                   << "\n";
       executor.terminateStateOnError(*s, 
                                      "wrong size given to klee_make_symbolic[_name]", 
                                      Executor::User);
@@ -780,4 +791,85 @@ void SpecialFunctionHandler::handleDivRemOverflow(ExecutionState &state,
                                                std::vector<ref<Expr> > &arguments) {
   executor.terminateStateOnError(state, "overflow on division or remainder",
                                  Executor::Overflow);
+}
+
+void SpecialFunctionHandler::handleEnableSeeding(
+    ExecutionState &state, KInstruction *target,
+    std::vector<ref<Expr> > &arguments) {
+  unsigned TTL = 2;
+  bool interleave = 0;
+  if (arguments.size() > 0) {
+    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(arguments[0])) {
+      TTL = CE->getZExtValue();
+    }
+    if (arguments.size() > 1) {
+      if (ConstantExpr *CE = dyn_cast<ConstantExpr>(arguments[1])) {
+        interleave = CE->getZExtValue();
+      }
+    }
+  }
+  executor.enableSeeding(state, TTL, interleave);
+}
+
+void SpecialFunctionHandler::handleDisableSeeding(
+    ExecutionState &state, KInstruction *target,
+    std::vector<ref<Expr> > &arguments) {
+  executor.disableSeeding(state);
+}
+
+extern bool ZestSkipChecks;
+
+void
+SpecialFunctionHandler::handleSkipChecks(ExecutionState &state,
+                                         KInstruction *target,
+                                         std::vector<ref<Expr> > &arguments) {
+  ZestSkipChecks = true;
+}
+
+void
+SpecialFunctionHandler::handleDoChecks(ExecutionState &state,
+                                       KInstruction *target,
+                                       std::vector<ref<Expr> > &arguments) {
+  ZestSkipChecks = false;
+}
+
+extern bool UseConcretePath;
+
+void
+SpecialFunctionHandler::handleZestEnabled(ExecutionState &state,
+                                          KInstruction *target,
+                                          std::vector<ref<Expr> > &arguments) {
+  // XXX should type check args
+  assert(arguments.size() == 0 &&
+         "invalid number of arguments to klee_zest_enabled");
+  executor.bindLocal(target, state,
+                     ConstantExpr::create(UseConcretePath, Expr::Int32));
+}
+
+void
+SpecialFunctionHandler::handlePatchBegin(ExecutionState &state,
+                                         KInstruction *target,
+                                         std::vector<ref<Expr> > &arguments) {
+  assert(arguments.size() == 0 &&
+         "invalid number of arguments to klee_patch_begin");
+  state.inPatch = true;
+  executor.addSensitiveInstruction(state);
+}
+
+void
+SpecialFunctionHandler::handlePatchEnd(ExecutionState &state,
+                                       KInstruction *target,
+                                       std::vector<ref<Expr> > &arguments) {
+  // 2 means execute until the next sym fork (due the ZEST searcher internals)
+  int TTL = 2;
+  if (arguments.size() == 1) {
+    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(arguments[0])) {
+      TTL = CE->getZExtValue() + 1;
+    }
+  }
+  state.inPatch = false;
+  state.seedingTTL = TTL;
+  if (0 == TTL) {
+    executor.disableSeeding(state);
+  }
 }

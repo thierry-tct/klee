@@ -20,12 +20,13 @@ Solver *constructSolverChain(Solver *coreSolver,
                              std::string querySMT2LogPath,
                              std::string baseSolverQuerySMT2LogPath,
                              std::string queryKQueryLogPath,
-                             std::string baseSolverQueryKQueryLogPath) {
+                             std::string baseSolverQueryKQueryLogPath,
+                             const InstructionInfoProvider *iip) {
   Solver *solver = coreSolver;
 
   if (optionIsSet(queryLoggingOptions, SOLVER_KQUERY)) {
     solver = createKQueryLoggingSolver(solver, baseSolverQueryKQueryLogPath,
-                                   MinQueryTimeToLog);
+                                   MinQueryTimeToLog, iip);
     klee_message("Logging queries that reach solver in .kquery format to %s\n",
                  baseSolverQueryKQueryLogPath.c_str());
   }
@@ -54,7 +55,7 @@ Solver *constructSolverChain(Solver *coreSolver,
 
   if (optionIsSet(queryLoggingOptions, ALL_KQUERY)) {
     solver = createKQueryLoggingSolver(solver, queryKQueryLogPath,
-                                       MinQueryTimeToLog);
+                                       MinQueryTimeToLog, iip);
     klee_message("Logging all queries in .kquery format to %s\n",
                  queryKQueryLogPath.c_str());
   }

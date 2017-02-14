@@ -24,6 +24,7 @@
 #include "llvm/ADT/Triple.h"
 #include "llvm/CodeGen/IntrinsicLowering.h"
 #include "llvm/Pass.h"
+#include "llvm/CodeGen/IntrinsicLowering.h"
 
 namespace llvm {
   class Function;
@@ -121,6 +122,19 @@ public:
   virtual bool runOnFunction(llvm::Function &f);
 };
   
+class AssertCheckPass : public llvm::ModulePass {
+  static char ID;
+
+public:
+#if (LLVM_VERSION_MAJOR == 2 && LLVM_VERSION_MINOR < 8)
+  AssertCheckPass() : llvm::ModulePass((intptr_t)&ID) {}
+#else
+  AssertCheckPass() : llvm::ModulePass(ID) {}
+#endif
+
+  virtual bool runOnModule(llvm::Module &M);
+};
+
 class DivCheckPass : public llvm::ModulePass {
   static char ID;
 public:

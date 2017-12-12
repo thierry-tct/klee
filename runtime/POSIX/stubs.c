@@ -26,10 +26,14 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include <sys/syscall.h>
+#include <sys/socket.h>
+#include <klee/klee.h>
 #include "klee/Config/config.h"
 
 void klee_warning(const char*);
 void klee_warning_once(const char*);
+int klee_get_errno(void);
 
 /* Silent ignore */
 
@@ -75,12 +79,14 @@ void sync(void) {
 extern int __fgetc_unlocked(FILE *f);
 extern int __fputc_unlocked(int c, FILE *f);
 
+/*
 int __socketcall(int type, int *args) __attribute__((weak));
 int __socketcall(int type, int *args) {
   klee_warning("ignoring (EAFNOSUPPORT)");
   errno = EAFNOSUPPORT;
   return -1;
 }
+*/
 
 int _IO_getc(FILE *f) __attribute__((weak));
 int _IO_getc(FILE *f) {
@@ -134,6 +140,7 @@ int symlink(const char *oldpath, const char *newpath) {
   return -1;
 }
 
+typedef int original_rename_t(const char *, const char *);
 int rename(const char *oldpath, const char *newpath) __attribute__((weak));
 int rename(const char *oldpath, const char *newpath) {
   klee_warning("ignoring (EPERM)");
@@ -555,3 +562,18 @@ int munmap(void*start, size_t length) {
   errno = EPERM;
   return -1;
 }
+
+char *setlocale(int a, char *b) __attribute__((weak));
+char *setlocale(int a, char *b) {
+  klee_warning("ignoring (EPERM)");
+  return 0;
+}
+
+char *getenv(const char *b) __attribute__((weak));
+char *getenv(const char *b) {
+  klee_warning("ignoring (EPERM)");
+  return 0;
+}
+
+// why is this needed? I don't know
+#include "sockets.c.inc"

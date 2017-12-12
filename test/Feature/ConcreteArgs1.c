@@ -1,4 +1,5 @@
 // RUN: %llvmgcc -emit-llvm -c -o %t1.bc %s
+// RUN: rm -rf %t.klee-out
 // RUN: %klee --output-dir=%t.klee-out --use-concrete-path %t1.bc Aa
 // RUN: test -f %t.klee-out/test000001.ptr.err
 
